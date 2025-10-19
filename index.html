@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自定义主题刷题器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', 'Noto Sans SC', sans-serif; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+        .chat-bubble { max-width: 100%; word-wrap: break-word; position: relative; }
+        .chat-bubble.user { background-color: #3b82f6; align-self: flex-end; text-align: center; font-size: 1.5rem; font-weight: bold; min-width: 60px; padding: 0.75rem 1.5rem; border-radius: 1.5rem; }
+        .chat-bubble.model { background-color: #374151; align-self: flex-start; padding: 1rem 1.5rem; border-radius: 1.5rem; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        #sidebar { transition: transform 0.3s ease-in-out; }
+        .context-menu { position: absolute; z-index: 100; display: none; }
+        .flashcard-container { perspective: 1000px; }
+        .flashcard { width: 100%; height: 100%; position: relative; transition: transform 0.6s; transform-style: preserve-3d; }
+        .flashcard.is-flipped { transform: rotateY(180deg); }
+        .flashcard-face { position: absolute; width: 100%; height: 100%; -webkit-backface-visibility: hidden; backface-visibility: hidden; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 2rem; border-radius: 1.5rem; overflow-y: auto; }
+        .flashcard-back { transform: rotateY(180deg); }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 flex items-center justify-center h-screen overflow-hidden">
+
+    <aside id="sidebar" class="absolute top-0 left-0 h-full w-64 bg-gray-900 border-r border-gray-700 z-40 transform -translate-x-full flex flex-col"></aside>
+    <div id="sidebar-overlay" class="hidden fixed inset-0 bg-black bg-opacity-50 z-30"></div>
+
+    <div id="app-container" class="w-full max-w-3xl h-screen md:h-[95vh] md:rounded-2xl flex flex-col bg-gray-800 shadow-2xl overflow-hidden">
+        <main id="main-content" class="flex flex-1 flex-col h-full"></main>
+    </div>
+
+    <div id="settings-modal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"></div>
+    <div id="topic-modal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"></div>
+
+<script>
+    // --- STATE MANAGEMENT ---
+    let isLoading = false, apiKey = '', currentTopic = '综合知识', allHistories = {}, currentQuestionBundle = null, currentMode = 'quiz';
+    let lastAnsweredQuestion = null;
+    let wrongAnswerState = { questions: [], currentIndex: 0 };
+
+    // --- DOM ELEMENTS ---
+    const mainContent = document.getElementById('main-content');
+    const sidebar = document.getElementById('sidebar');
+    const sidebarOverlay = document.getElementById('sidebar-overlay');
+    const settingsModal = document.getElementById('settings-modal');
+    const topicModal = document.getElementById('topic-modal');
+
+    // --- AI CONFIG ---
+    const BASE_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=';
+    const generationConfig = { responseMimeType: "application/json", responseSchema: { type: "OBJECT", properties: { explanation: { type: "STRING" }, question_bundle: { type: "OBJECT", properties: { question_text: { type: "STRING" }, options: { type: "ARRAY", items: { type: "STRING" } }, correct_answer_letter: { type: "STRING"} }, required: ["question_text", "options", "correct_answer_letter"] } }, required: ["explanation", "question_bundle"] } };
+    
+    // --- FUNCTION DEFINITIONS ---
+    function openSettingsModal() { settingsModal.classList.remove('hidden'); document.getElementById('api-key-input').value = apiKey; }
+    function closeSettingsModal() { settingsModal.classList.add('hidden'); }
+    function openTopicModal() { topicModal.classList.remove('hidden'); document.getElementById('topic-input').value = currentTopic; }
+    function closeTopicModal() { topicModal.classList.add('hidden'); }
+    function toggleSidebar() { sidebar.classList.toggle('-translate-x-full'); sidebarOverlay.classList.toggle('hidden'); }
+
+    function saveApiKey() { 
+        const newKey = document.getElementById('api-key-input').value.trim(); 
+        if (newKey) { 
+            apiKey = newKey; 
+            localStorage.setItem('geminiApiKey', newKey); 
+            closeSettingsModal(); 
+            if (!allHistories[currentTopic] || allHistories[currentTopic].history.length === 0) {
+                 switchTopic(currentTopic, true);
+            } 
+        } else { alert('请输入有效的 API Key。'); } 
+    }
+
+    function saveTopicAndStart() { 
+        const newTopic = document.getElementById('topic-input').value.trim(); 
+        if (newTopic) { 
+            closeTopicModal(); 
+            switchTopic(newTopic, !allHistories[newTopic]); 
+        } else { alert('请输入有效的主题关键词。'); } 
+    }
+    
+    // --- INITIALIZATION ---
+    document.addEventListener('DOMContentLoaded', initializeApp);
+
+    function initializeApp() {
+        renderModals();
+        renderSidebar();
+        loadAllHistories();
+        renderHistoryList();
+        const lastTopic = localStorage.getItem('quizLastTopic') || '综合知识';
+        switchTopic(lastTopic);
+        if (!loadApiKey()) openSettingsModal();
+        setupGlobalEventListeners();
+    }
+
+    function setupGlobalEventListeners() {
+        sidebarOverlay.addEventListener('click', toggleSidebar);
+        document.body.addEventListener('click', (e) => {
+            if (!e.target.closest('.context-menu-parent')) closeContextMenu();
+        });
+        mainContent.addEventListener('click', e => {
+             const wrongBtn = e.target.closest('.wrong-question-btn');
+            if (wrongBtn) toggleWrongQuestion(wrongBtn.dataset.questionId, wrongBtn);
+        });
+        document.addEventListener('keydown', (e) => {
+            if (isLoading || currentMode !== 'quiz') return;
+            const keyMap = { 'a': 'A', 's': 'B', 'z': 'C', 'x': 'D' };
+            const key = e.key.toLowerCase();
+            if (key in keyMap) { e.preventDefault(); handleOptionClick(keyMap[key]); }
+        });
+    }
+
+    // --- RENDER FUNCTIONS ---
+    function renderQuizInterface() {
+        currentMode = 'quiz';
+        mainContent.innerHTML = `
+            <header class="bg-gray-900/50 backdrop-blur-sm p-4 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
+                <button id="sidebar-toggle-btn" title="打开历史" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg></button>
+                <h2 id="topic-title" class="text-xl font-bold text-white truncate px-2"></h2>
+                <div class="flex items-center space-x-4">
+                    <button id="topic-btn" title="设置主题" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg></button>
+                    <button id="settings-btn" title="设置API" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg></button>
+                    <button id="restart-btn" class="text-sm text-gray-400 hover:text-white transition">新对话</button>
+                </div>
+            </header>
+            <main id="chat-messages" class="flex-1 p-6 overflow-y-auto flex flex-col space-y-4"></main>
+            <div id="loading-spinner" class="hidden p-6 flex items-center justify-center flex-shrink-0"><div class="flex items-center space-x-2 text-gray-400"><svg class="h-6 w-6 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg><span>正在出题...</span></div></div>
+            <footer class="p-4 border-t border-gray-700 bg-gray-800 flex-shrink-0"><div id="options-container" class="grid grid-cols-4 gap-3"></div></footer>
+        `;
+        document.getElementById('restart-btn').addEventListener('click', () => switchTopic(currentTopic, true));
+        document.getElementById('settings-btn').addEventListener('click', openSettingsModal);
+        document.getElementById('topic-btn').addEventListener('click', openTopicModal);
+        document.getElementById('sidebar-toggle-btn').addEventListener('click', toggleSidebar);
+        document.getElementById('options-container').addEventListener('click', (e) => {
+            const card = e.target.closest('.option-card');
+            if (card && !isLoading) handleOptionClick(card.dataset.choice);
+        });
+        document.getElementById('topic-title').textContent = currentTopic;
+    }
+
+    function renderModals() {
+        settingsModal.innerHTML = `<div class="bg-gray-800 rounded-2xl p-8 w-full max-w-md shadow-2xl border border-gray-700"><h2 class="text-2xl font-bold mb-4 text-white">设置 API 密钥</h2><p class="text-gray-400 mb-6">请输入您的 Google Gemini API 密钥。</p><label for="api-key-input" class="block text-sm font-medium text-gray-300 mb-2">API KEY:</label><input type="password" id="api-key-input" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-200 focus:ring-2 focus:ring-blue-500"><div class="mt-6 flex justify-end space-x-4"><button id="cancel-settings-btn" class="py-2 px-5 bg-gray-600 hover:bg-gray-500 rounded-lg transition">取消</button><button id="save-settings-btn" class="py-2 px-5 bg-blue-600 hover:bg-blue-700 rounded-lg transition">保存</button></div></div>`;
+        topicModal.innerHTML = `<div class="bg-gray-800 rounded-2xl p-8 w-full max-w-md shadow-2xl border border-gray-700"><h2 class="text-2xl font-bold mb-4 text-white">设置出题主题</h2><p class="text-gray-400 mb-6">请输入出题领域的关键词，例如 "PMP项目管理"。</p><label for="topic-input" class="block text-sm font-medium text-gray-300 mb-2">主题关键词:</label><input type="text" id="topic-input" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-200 focus:ring-2 focus:ring-blue-500"><div class="mt-6 flex justify-end space-x-4"><button id="cancel-topic-btn" class="py-2 px-5 bg-gray-600 hover:bg-gray-500 rounded-lg transition">取消</button><button id="save-topic-btn" class="py-2 px-5 bg-blue-600 hover:bg-blue-700 rounded-lg transition">开始刷题</button></div></div>`;
+        
+        document.getElementById('cancel-settings-btn').addEventListener('click', closeSettingsModal);
+        document.getElementById('save-settings-btn').addEventListener('click', saveApiKey);
+        document.getElementById('cancel-topic-btn').addEventListener('click', closeTopicModal);
+        document.getElementById('save-topic-btn').addEventListener('click', saveTopicAndStart);
+    }
+    
+    function renderSidebar() {
+        sidebar.innerHTML = `
+            <div class="p-4 border-b border-gray-700">
+                <h3 class="text-lg font-bold text-white">对话历史</h3>
+            </div>
+            <nav id="history-list" class="flex-1 overflow-y-auto p-2"></nav>
+            <div class="p-4 border-t border-gray-700">
+                <button id="clear-history-btn" class="w-full text-sm text-red-400 hover:text-red-300 bg-red-900/50 hover:bg-red-900/80 py-2 rounded-lg transition-colors">清除所有记录</button>
+            </div>
+        `;
+        document.getElementById('clear-history-btn').addEventListener('click', clearAllHistory);
+    }
+
+    async function fetchNextQuestionAndExplanation(previousQuestionBundle) {
+        if (!apiKey) { openSettingsModal(); return; }
+        setLoading(true);
+        lastAnsweredQuestion = { bundle: previousQuestionBundle }; 
+        
+        const systemPrompt = `你是一位出题专家。你的任务是严格围绕“${currentTopic}”这个主题出题。根据收到的'上一题'信息，先为'上一题'生成一个专业解析，然后再生成一个全新的、与'上一题'无关的、但与“${currentTopic}”主题相关的、高质量的专业选择题包。你的回复必须是纯净的JSON格式，且只包含两个字段：'explanation' (对上一题的解析) 和 'question_bundle' (一个包含 'question_text', 'options', 和 'correct_answer_letter' 的新题目对象)。`;
+        const userMessage = previousQuestionBundle ? `这是上一道题：${JSON.stringify(previousQuestionBundle)}。请为这道题提供解析，并给我一道全新的、关于“${currentTopic}”的题目。` : `请给我第一道关于“${currentTopic}”的题目，解析部分请留空。`;
+        
+        const payload = { contents: [{ role: 'user', parts: [{ text: userMessage }] }], systemInstruction: { parts: [{ text: systemPrompt }] }, generationConfig };
+        try {
+            const response = await fetch(BASE_API_URL + apiKey, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (!response.ok) { const errorBody = await response.json(); throw new Error(`API 请求失败: ${errorBody.error.message}`); }
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+            if (!candidate?.content?.parts?.[0]?.text) throw new Error("返回的数据结构无效。");
+            
+            const rawText = candidate.content.parts[0].text;
+            try {
+                const cleanedText = rawText.trim().replace(/```json|```/g, '').trim();
+                const jsonResponse = JSON.parse(cleanedText);
+                if (!jsonResponse.question_bundle) throw new Error("返回的JSON缺少 'question_bundle'。");
+                
+                if (lastAnsweredQuestion.bundle) {
+                    lastAnsweredQuestion.explanation = jsonResponse.explanation;
+                }
+
+                addHistoryItem({ type: 'model', content: jsonResponse });
+                addMessageToUI(jsonResponse, 'model');
+                currentQuestionBundle = jsonResponse.question_bundle;
+            } catch (parseError) { handleError("JSON 解析失败", rawText, parseError); }
+        } catch (error) { handleError('调用 Gemini API 时出错', null, error); } finally { setLoading(false); }
+    }
+    
+    function handleOptionClick(userChoice) {
+        if (!currentQuestionBundle) return;
+        const isCorrect = userChoice === currentQuestionBundle.correct_answer_letter;
+        addHistoryItem({ type: 'user', content: userChoice });
+        addHistoryItem({ type: 'feedback', content: { isCorrect, correctAnswer: currentQuestionBundle.correct_answer_letter } });
+        addMessageToUI(userChoice, 'user');
+        addFeedbackToUI(isCorrect, currentQuestionBundle.correct_answer_letter, currentQuestionBundle);
+        
+        fetchNextQuestionAndExplanation(currentQuestionBundle);
+    }
+    
+    function switchTopic(topic, forceNew = false) {
+        currentTopic = topic;
+        localStorage.setItem('quizLastTopic', topic);
+        renderQuizInterface();
+        currentQuestionBundle = null;
+        lastAnsweredQuestion = null;
+
+        if (allHistories[currentTopic] && !forceNew) {
+            loadChatFromHistory();
+        } else {
+            if (!allHistories[currentTopic] || forceNew) {
+                // When starting a new conversation, only clear history, not wrong questions or pinned status
+                const existingData = allHistories[currentTopic] || {};
+                allHistories[currentTopic] = { 
+                    ...existingData,
+                    history: []
+                };
+            }
+            saveAllHistories();
+            fetchNextQuestionAndExplanation(null);
+        }
+        renderHistoryList();
+        if (sidebar.classList.contains('translate-x-0')) {
+           toggleSidebar();
+        }
+    }
+    
+    function loadChatFromHistory() {
+        const topicData = allHistories[currentTopic] || { history: [] };
+        const history = topicData.history;
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        chatMessagesEl.innerHTML = '';
+        let lastModelItem = null;
+        history.forEach((item, index) => {
+            if (item.type === 'model') {
+                addMessageToUI(item.content, 'model');
+                lastModelItem = item;
+            } else if (item.type === 'user') {
+                addMessageToUI(item.content, 'user');
+            } else if (item.type === 'feedback') {
+                const correspondingModelItem = history.find((h, i) => i < index && h.type === 'model');
+                if(correspondingModelItem){
+                    addFeedbackToUI(item.content.isCorrect, item.content.correctAnswer, correspondingModelItem.content.question_bundle);
+                }
+            }
+        });
+        if (lastModelItem) {
+            currentQuestionBundle = lastModelItem.content.question_bundle;
+        } else {
+            fetchNextQuestionAndExplanation(null);
+        }
+        renderAnswerButtons(true); // Ensure buttons are visible when loading history
+    }
+
+    function addHistoryItem(item) {
+        if (!allHistories[currentTopic]) allHistories[currentTopic] = { history: [], wrongQuestions: {}, pinned: false };
+        allHistories[currentTopic].history.push(item);
+        saveAllHistories();
+    }
+
+    function loadAllHistories() {
+        const stored = localStorage.getItem('quizAllHistories');
+        allHistories = stored ? JSON.parse(stored) : {};
+    }
+
+    function saveAllHistories() {
+        localStorage.setItem('quizAllHistories', JSON.stringify(allHistories));
+        renderHistoryList();
+    }
+
+    function renderHistoryList() {
+        const historyListEl = document.getElementById('history-list');
+        if (!historyListEl) return;
+        historyListEl.innerHTML = '';
+        const topics = Object.keys(allHistories);
+        const sortedTopics = topics.sort((a, b) => {
+            const aIsPinned = (allHistories[a] && allHistories[a].pinned);
+            const bIsPinned = (allHistories[b] && allHistories[b].pinned);
+            if (aIsPinned && !bIsPinned) return -1;
+            if (!aIsPinned && bIsPinned) return 1;
+            return a.localeCompare(b);
+        });
+
+        if (sortedTopics.length === 0) {
+            historyListEl.innerHTML = `<p class="p-4 text-sm text-gray-500">还没有历史记录。</p>`;
+            return;
+        }
+
+        sortedTopics.forEach(topic => {
+            const isPinned = (allHistories[topic] && allHistories[topic].pinned);
+            const wrapper = document.createElement('div');
+            wrapper.className = `group flex items-center justify-between p-3 text-sm rounded-md ${topic === currentTopic ? 'bg-blue-600 text-white font-bold' : 'hover:bg-gray-700'}`;
+            const link = document.createElement('a');
+            link.href = "#";
+            link.className = 'truncate flex-1';
+            link.textContent = isPinned ? `📌 ${topic}` : topic;
+            link.onclick = (e) => { e.preventDefault(); switchTopic(topic); };
+            const menuButton = document.createElement('button');
+            menuButton.className = 'context-menu-parent opacity-0 group-hover:opacity-100 transition-opacity ml-2 p-1 rounded-full hover:bg-gray-600';
+            menuButton.innerHTML = `<svg class="h-4 w-4 pointer-events-none" fill="currentColor" viewBox="0 0 20 20"><path d="M10 6a2 2 0 110-4 2 2 0 010 4zM10 12a2 2 0 110-4 2 2 0 010 4zM10 18a2 2 0 110-4 2 2 0 010 4z"></path></svg>`;
+            menuButton.onclick = (e) => { e.stopPropagation(); showContextMenu(e.currentTarget, topic); };
+            wrapper.appendChild(link);
+            wrapper.appendChild(menuButton);
+            historyListEl.appendChild(wrapper);
+        });
+    }
+    
+    function showContextMenu(button, topic) {
+        closeContextMenu(); 
+        const rect = button.getBoundingClientRect();
+        const menu = document.createElement('div');
+        menu.id = 'context-menu';
+        menu.className = 'context-menu w-48 bg-gray-800 border border-gray-700 rounded-md shadow-lg py-1';
+        menu.style.display = 'block';
+        menu.style.top = `${rect.bottom}px`;
+        menu.style.left = `${rect.left - 192}px`; 
+
+        const isPinned = (allHistories[topic] && allHistories[topic].pinned);
+        const pinOption = document.createElement('a');
+        pinOption.href = '#';
+        pinOption.textContent = isPinned ? '取消固定' : '固定';
+        pinOption.className = 'block px-4 py-2 text-sm hover:bg-gray-700';
+        pinOption.onclick = (e) => { e.preventDefault(); togglePin(topic); closeContextMenu(); };
+        
+        const wrongQuestions = allHistories[topic]?.wrongQuestions ? Object.keys(allHistories[topic].wrongQuestions) : [];
+        if (wrongQuestions.length > 0) {
+            const wrongCardOption = document.createElement('a');
+            wrongCardOption.href = '#';
+            wrongCardOption.textContent = '错题卡片';
+            wrongCardOption.className = 'block px-4 py-2 text-sm hover:bg-gray-700';
+            wrongCardOption.onclick = (e) => { e.preventDefault(); startFlashcardReview(topic); closeContextMenu(); };
+            menu.appendChild(wrongCardOption);
+        }
+
+        const deleteHistoryOption = document.createElement('a');
+        deleteHistoryOption.href = '#';
+        deleteHistoryOption.textContent = '删除历史记录';
+        deleteHistoryOption.className = 'block px-4 py-2 text-sm hover:bg-gray-700';
+        deleteHistoryOption.onclick = (e) => { e.preventDefault(); deleteHistoryOnly(topic); closeContextMenu(); };
+        
+        const deleteCompletelyOption = document.createElement('a');
+        deleteCompletelyOption.href = '#';
+        deleteCompletelyOption.textContent = '彻底删除';
+        deleteCompletelyOption.className = 'block px-4 py-2 text-sm text-red-400 hover:bg-red-900/50';
+        deleteCompletelyOption.onclick = (e) => { e.preventDefault(); deleteTopicCompletely(topic); closeContextMenu(); };
+
+        menu.appendChild(pinOption);
+        menu.appendChild(deleteHistoryOption);
+        menu.appendChild(document.createElement('hr')).className = 'border-gray-700 my-1';
+        menu.appendChild(deleteCompletelyOption);
+        
+        document.body.appendChild(menu);
+    }
+
+    function closeContextMenu() {
+        const menu = document.getElementById('context-menu');
+        if (menu) menu.remove();
+    }
+    
+    function togglePin(topic) {
+        if (!allHistories[topic]) return;
+        allHistories[topic].pinned = !allHistories[topic].pinned;
+        saveAllHistories();
+    }
+
+    function deleteHistoryOnly(topic) {
+        if (confirm(`确定要删除主题 "${topic}" 的对话历史吗？错题本将保留。`)) {
+            if (allHistories[topic]) {
+                allHistories[topic].history = [];
+                saveAllHistories();
+                if (topic === currentTopic) {
+                    switchTopic(topic, true); // Reload current topic with new conversation
+                }
+            }
+        }
+    }
+    
+    function deleteTopicCompletely(topic) {
+        if (confirm(`警告：确定要彻底删除主题 "${topic}" 吗？\n所有对话历史和错题本都将被永久删除！`)) {
+            delete allHistories[topic];
+            saveAllHistories();
+            if (topic === currentTopic) {
+                switchTopic(Object.keys(allHistories)[0] || '综合知识', true);
+            } else {
+                renderHistoryList();
+            }
+        }
+    }
+    
+    function clearAllHistory() {
+        if (confirm('确定要清除所有历史记录吗？此操作无法撤销。')) {
+            allHistories = {};
+            currentQuestionBundle = null;
+            localStorage.removeItem('quizAllHistories');
+            switchTopic('综合知识', true);
+        }
+    }
+
+    function loadApiKey() { const savedKey = localStorage.getItem('geminiApiKey'); if (savedKey) { apiKey = savedKey; return true; } return false; }
+    
+    function setLoading(loadingState) { 
+        isLoading = loadingState; 
+        const spinner = document.getElementById('loading-spinner');
+        if (spinner) spinner.classList.toggle('hidden', !loadingState);
+        renderAnswerButtons(!loadingState); 
+    }
+    
+    function renderAnswerButtons(enabled) { 
+        const optionsContainerEl = document.getElementById('options-container');
+        if (!optionsContainerEl) return;
+        optionsContainerEl.innerHTML = '';
+        const choices = ['A', 'B', 'C', 'D'];
+        choices.forEach((choice) => { 
+            const card = document.createElement('button');
+            card.className = 'option-card w-full bg-gray-700 hover:bg-gray-600 text-center py-3 px-4 rounded-lg transition font-bold text-lg';
+            card.dataset.choice = choice;
+            card.disabled = !enabled;
+            if(!enabled) card.classList.add('opacity-50', 'pointer-events-none');
+            card.innerHTML = `<span>${choice}</span>`;
+            optionsContainerEl.appendChild(card);
+        });
+    }
+
+    function addMessageToUI(content, role) {
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        const wrapper = document.createElement('div');
+        if (role === 'model') {
+            wrapper.classList.add('chat-bubble', 'model');
+            const { explanation, question_bundle } = content;
+            const optionsHTML = question_bundle.options.map((opt, i) => `<p>${String.fromCharCode(65 + i)}. ${opt}</p>`).join('');
+            let explanationHTML = explanation ? `<p><strong>【答案解析】</strong><br>${explanation}</p><hr class="border-gray-700 my-4">` : '';
+            wrapper.innerHTML = `${explanationHTML}<p><strong>【新题目】</strong><br>${question_bundle.question_text}</p>${optionsHTML}`;
+        } else { // user
+            wrapper.classList.add('chat-bubble', 'user');
+            wrapper.textContent = content;
+        }
+        chatMessagesEl.appendChild(wrapper);
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    }
+    
+    function addFeedbackToUI(isCorrect, correctAnswer, questionBundle) {
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        const feedback = document.createElement('div');
+        feedback.className = 'flex justify-end items-center pr-2 text-lg space-x-4';
+        const icon = isCorrect ? '✅' : '❌';
+        
+        const questionId = btoa(encodeURIComponent(questionBundle.question_text));
+        const isWrong = allHistories[currentTopic]?.wrongQuestions?.[questionId];
+        const btnClass = isWrong ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-600 hover:bg-blue-700';
+        const btnIcon = isWrong ? '-' : '+';
+        const wrongBtnHTML = `<button data-question-id="${questionId}" class="wrong-question-btn w-8 h-8 ${btnClass} rounded-full text-white font-bold text-lg transition-colors">${btnIcon}</button>`;
+        
+        feedback.innerHTML = `${wrongBtnHTML}<span>${icon} 正确答案: <strong>${correctAnswer}</strong></span>`;
+        chatMessagesEl.appendChild(feedback);
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    }
+
+    function handleError(title, rawText, error) {
+        console.error(title, error, rawText);
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        const errorContent = `<p><strong>抱歉，出错了</strong></p><p>${error.message}</p>${rawText ? `<p><small>原始数据: ${rawText}</small></p>` : ''}<p>请稍后重试或重新开始。</p>`;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'chat-bubble model bg-red-900/50 border border-red-500';
+        wrapper.innerHTML = errorContent;
+        chatMessagesEl.appendChild(wrapper);
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    }
+
+    function toggleWrongQuestion(questionId, button) {
+        if (!allHistories[currentTopic].wrongQuestions) allHistories[currentTopic].wrongQuestions = {};
+        const wrongQuestions = allHistories[currentTopic].wrongQuestions;
+
+        if (wrongQuestions[questionId]) {
+            delete wrongQuestions[questionId];
+        } else {
+            if (lastAnsweredQuestion && lastAnsweredQuestion.bundle) {
+                 const answeredQuestionId = btoa(encodeURIComponent(lastAnsweredQuestion.bundle.question_text));
+                 if(answeredQuestionId === questionId) {
+                     wrongQuestions[questionId] = lastAnsweredQuestion;
+                 }
+            }
+        }
+        saveAllHistories();
+        
+        if(button) {
+            const isWrong = !!wrongQuestions[questionId];
+            button.textContent = isWrong ? '-' : '+';
+            button.classList.toggle('bg-red-500', isWrong);
+            button.classList.toggle('hover:bg-red-600', isWrong);
+            button.classList.toggle('bg-blue-600', !isWrong);
+            button.classList.toggle('hover:bg-blue-700', !isWrong);
+        }
+    }
+    
+    function addWrongQuestion(questionBundle) {
+        // This is now handled inside toggleWrongQuestion, called when feedback is given
+    }
+
+    function startFlashcardReview(topic) {
+        const wrongQuestions = allHistories[topic]?.wrongQuestions ? Object.values(allHistories[topic].wrongQuestions) : [];
+        if (wrongQuestions.length === 0) { alert('这个主题下没有错题。'); return; }
+        currentMode = 'flashcard';
+        wrongAnswerState.questions = wrongQuestions;
+        wrongAnswerState.currentIndex = 0;
+        renderFlashcardInterface();
+    }
+    
+    function renderFlashcardInterface() {
+        const item = wrongAnswerState.questions[wrongAnswerState.currentIndex];
+        const question = item.bundle;
+        const explanation = item.explanation || "暂无解析";
+        const questionId = btoa(encodeURIComponent(question.question_text));
+
+        const optionsHTML = question.options.map((opt, i) => `<p class="text-left w-full">${String.fromCharCode(65 + i)}. ${opt}</p>`).join('');
+        
+        mainContent.innerHTML = `
+            <header class="bg-gray-900/50 backdrop-blur-sm p-4 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
+                <button id="exit-flashcard-btn" class="text-sm text-gray-400 hover:text-white transition">返回</button>
+                <h2 class="text-xl font-bold text-white">${currentTopic} (错题卡片)</h2>
+                <div class="flex items-center space-x-2">
+                    <button id="delete-flashcard-btn" title="从错题本移除" class="text-red-400 hover:text-red-300 transition">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    </button>
+                    <span>${wrongAnswerState.currentIndex + 1} / ${wrongAnswerState.questions.length}</span>
+                </div>
+            </header>
+            <main class="flex-1 p-6 flex flex-col items-center justify-center">
+                <div class="w-full h-full max-w-lg flashcard-container">
+                    <div id="flashcard" class="flashcard">
+                        <div class="flashcard-face flashcard-front bg-gray-700">
+                            <p class="text-xl text-center mb-4">${question.question_text}</p>
+                            <div class="text-left w-full space-y-2">${optionsHTML}</div>
+                            <p class="mt-4 text-sm text-gray-400">点击卡片查看答案</p>
+                        </div>
+                        <div class="flashcard-face flashcard-back bg-blue-800">
+                            <p class="mb-4 font-bold text-lg text-green-300">正确答案: ${question.correct_answer_letter}</p>
+                            <p class="text-left">${explanation}</p>
+                        </div>
+                    </div>
+                </div>
+            </main>
+            <footer class="p-4 border-t border-gray-700 bg-gray-800 flex-shrink-0 flex justify-between">
+                <button id="prev-flashcard-btn" class="py-2 px-5 bg-gray-700 hover:bg-gray-600 rounded-lg transition">上一张</button>
+                <button id="next-flashcard-btn" class="py-2 px-5 bg-gray-700 hover:bg-gray-600 rounded-lg transition">下一张</button>
+            </footer>
+        `;
+        
+        document.getElementById('exit-flashcard-btn').addEventListener('click', () => switchTopic(currentTopic));
+        document.getElementById('flashcard').addEventListener('click', () => document.getElementById('flashcard').classList.toggle('is-flipped'));
+        document.getElementById('prev-flashcard-btn').addEventListener('click', () => {
+            if (wrongAnswerState.currentIndex > 0) {
+                wrongAnswerState.currentIndex--;
+                renderFlashcardInterface();
+            }
+        });
+        document.getElementById('next-flashcard-btn').addEventListener('click', () => {
+            if (wrongAnswerState.currentIndex < wrongAnswerState.questions.length - 1) {
+                wrongAnswerState.currentIndex++;
+                renderFlashcardInterface();
+            }
+        });
+        document.getElementById('delete-flashcard-btn').addEventListener('click', () => {
+             delete allHistories[currentTopic].wrongQuestions[questionId];
+             saveAllHistories();
+             wrongAnswerState.questions.splice(wrongAnswerState.currentIndex, 1);
+             if (wrongAnswerState.questions.length === 0) {
+                 alert("所有错题已复习完毕！");
+                 switchTopic(currentTopic);
+             } else if (wrongAnswerState.currentIndex >= wrongAnswerState.questions.length) {
+                 wrongAnswerState.currentIndex = wrongAnswerState.questions.length - 1;
+             }
+             renderFlashcardInterface();
+        });
+    }
+
+</script>
+</body>
+</html>
